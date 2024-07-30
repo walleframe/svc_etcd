@@ -8,7 +8,9 @@ import (
 
 	"bytes"
 
+	"github.com/google/uuid"
 	"github.com/walleframe/walle/kvstore"
+	"github.com/walleframe/walle/util"
 	"github.com/walleframe/walle/zaplog"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	namespace "go.etcd.io/etcd/client/v3/namespace"
@@ -379,21 +381,90 @@ func (store *etcdStore) WatchTree(ctx context.Context, directory string, stopCh 
 // The returned Locker is not held and must be acquired
 // with `.Lock`. The Value is optional.
 func (store *etcdStore) NewLock(ctx context.Context, key string, opts ...kvstore.LockOption) (kvstore.Locker, error) {
-	// TODO: impletement
-	return nil, nil
+	//id := uuid.NewString()
+	size := len(key) + 1 //+ len(id)
+	if len(store.opts.Namespace) > 0 {
+		size += 1 + len(store.opts.Namespace)
+	}
+	prefix := util.StringBuilder(size, func(buf *util.Builder) {
+		if len(store.opts.Namespace) > 0 {
+			buf.WriteString(store.opts.Namespace)
+			buf.WriteByte('/')
+		}
+		buf.WriteString(key)
+		buf.WriteByte('/')
+		//buf.WriteString(id)
+	})
+	opt := kvstore.NewLockOptions(opts...)
+	locker := &etcdv3Lock{
+		cli:    store.cli,
+		kv:     store.kv,
+		prefix: prefix,
+		key:    "",
+		value:  string(opt.Value),
+		ttl:    opt.TTL,
+		logger: store.opts.Logger,
+	}
+	return locker, nil
 }
 
 // Atomic CAS operation on a single value.
 // Pass previous = nil to create a new key.
-func (store *etcdStore) AtomicPut(ctx context.Context, key string, value []byte, previous *kvstore.KVPair, opts ...kvstore.WriteOption) (bool, *kvstore.KVPair, error) {
-	// TODO: impletement
-	return false, nil, nil
+func (store *etcdStore) AtomicPut(ctx context.Context, key string, value []byte, previous *kvstore.KVPair, opts ...kvstore.WriteOption) (ok bool, new *kvstore.KVPair, err error) {
+	key = Normalize(key)
+	if previous == nil {
+		rsp, err := store.kv.Put(ctx, key, string(value))
+		if err != nil {
+			if store.opts.Logger.Debug() {
+				store.opts.Logger.New("AtomicPut").Error("put failed",
+					zap.String("key", key),
+					zap.Binary("value", value),
+					zap.Error(err),
+				)
+			}
+			return false, nil, err
+		}
+		return true, &kvstore.KVPair{
+			Key:       key,
+			Value:     value,
+			LastIndex: uint64(rsp.Header.Revision),
+		}, nil
+	}
+	rsp, err := store.kv.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(key), "=", int64(previous.LastIndex))).Then(clientv3.OpPut(key, string(value))).Commit()
+	if err != nil {
+		if store.opts.Logger.Debug() {
+			store.opts.Logger.New("AtomicPut").Error("exec txn failed", zap.Error(err))
+		}
+		return
+	}
+	ok = rsp.Succeeded
+
+	if ok && len(rsp.Responses) > 0 {
+		put := rsp.Responses[0].GetResponsePut()
+		new = &kvstore.KVPair{
+			Key:       key,
+			Value:     value,
+			LastIndex: uint64(put.Header.Revision),
+		}
+	}
+	return
 }
 
 // Atomic delete of a single value
-func (store *etcdStore) AtomicDelete(ctx context.Context, key string, previous *kvstore.KVPair) (bool, error) {
-	// TODO: impletement
-	return false, nil
+func (store *etcdStore) AtomicDelete(ctx context.Context, key string, previous *kvstore.KVPair) (ok bool, err error) {
+	if previous == nil {
+		return true, store.Delete(ctx, key)
+	}
+	key = Normalize(key)
+	rsp, err := store.kv.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(key), "=", int64(previous.LastIndex))).Then(clientv3.OpDelete(key)).Commit()
+	if err != nil {
+		if store.opts.Logger.Debug() {
+			store.opts.Logger.New("AtomicDelete").Error("exec txn failed", zap.Error(err))
+		}
+		return
+	}
+	ok = rsp.Succeeded
+	return
 }
 
 // Close the store connection
@@ -430,4 +501,144 @@ func (store *etcdStore) Close(ctx context.Context) {
 var Normalize = func(key string) string {
 	key = kvstore.Normalize(key)
 	return strings.TrimPrefix(key, "/")
+}
+
+type etcdv3Lock struct {
+	cli    *clientv3.Client
+	kv     clientv3.KV
+	prefix string
+	key    string
+	value  string
+	ttl    time.Duration
+	logger *zaplog.Logger
+}
+
+func (l *etcdv3Lock) TryLock(ctx context.Context) (err error) {
+	id := uuid.NewString()
+	l.key = util.StringBuilder(len(l.prefix)+len(id), func(buf *util.Builder) {
+		buf.WriteString(l.prefix)
+		buf.WriteString(id)
+	})
+	log := l.logger.New("TryLock")
+	rsp, err := l.kv.Put(ctx, l.key, l.value)
+	if err != nil {
+		if log.EnableDebug() {
+			log.Debug("write lock key failed", zap.String("key", l.key), zap.Error(err))
+		}
+		return
+	}
+	list, err := l.kv.Get(ctx, l.prefix, clientv3.WithPrefix())
+	if err != nil {
+		if log.EnableDebug() {
+			log.Debug("get lock prefix failed", zap.String("key", l.key), zap.Error(err))
+		}
+		l.Unlock()
+		return
+	}
+	for _, v := range list.Kvs {
+		if rsp.Header.Revision > v.ModRevision {
+			l.Unlock()
+			if log.EnableDebug() {
+				log.Debug("get lock prefix failed", zap.String("key", l.key), zap.Error(err))
+			}
+			return kvstore.ErrCannotLock
+		}
+	}
+	return
+}
+func (l *etcdv3Lock) Lock(ctx context.Context) (err error) {
+	id := uuid.NewString()
+	l.key = util.StringBuilder(len(l.prefix)+len(id), func(buf *util.Builder) {
+		buf.WriteString(l.prefix)
+		buf.WriteString(id)
+	})
+	log := l.logger.New("Lock")
+	rsp, err := l.kv.Put(ctx, l.key, l.value)
+	if err != nil {
+		if log.EnableDebug() {
+			log.Debug("write lock key failed", zap.String("key", l.key), zap.Error(err))
+		}
+		return
+	}
+	list, err := l.kv.Get(ctx, l.prefix, clientv3.WithPrefix())
+	if err != nil {
+		l.Unlock()
+		if log.EnableDebug() {
+			log.Debug("get prefix key failed", zap.String("key", l.key), zap.Error(err))
+		}
+		return
+	}
+	locked := true
+	for _, v := range list.Kvs {
+		if rsp.Header.Revision > v.ModRevision {
+			locked = false
+			break
+		}
+	}
+	if locked {
+		return nil
+	}
+
+	timer := time.NewTimer(l.ttl)
+	defer timer.Stop()
+
+	watcher := clientv3.NewWatcher(l.cli)
+	defer watcher.Close()
+	ch := watcher.Watch(ctx, l.prefix, clientv3.WithPrefix())
+	for {
+		select {
+		case <-timer.C:
+			l.Unlock()
+			if log.EnableDebug() {
+				log.Debug("touck time", zap.String("key", l.key))
+			}
+			return kvstore.ErrLockCancel
+		case <-ctx.Done():
+			l.Unlock()
+			if log.EnableDebug() {
+				log.Debug("context done", zap.String("key", l.key))
+			}
+			return kvstore.ErrLockCancel
+		case rsp := <-ch:
+			list, err := l.kv.Get(ctx, l.prefix, clientv3.WithPrefix())
+			if err != nil {
+				log.Error("get lock list failed", zap.String("key", l.key), zap.Error(err))
+				continue
+			}
+			locked = true
+			for _, v := range list.Kvs {
+				if rsp.Header.Revision > v.ModRevision {
+					locked = false
+					break
+				}
+			}
+			if locked {
+				return nil
+			}
+		}
+	}
+}
+
+func (l *etcdv3Lock) Unlock() error {
+	if len(l.key) < 1 {
+		return nil
+	}
+	key := l.key
+	_, err := l.kv.Delete(context.Background(), key)
+	if err != nil {
+		l.logger.New("Unlock").Error("delete lock failed", zap.String("key", key), zap.Error(err))
+		// 5秒内重试5次删除
+		go func() {
+			for i := 0; i < 5; i++ {
+				time.Sleep(time.Second)
+				_, err := l.kv.Delete(context.Background(), key)
+				if err != nil {
+					l.logger.New("Unlock.Retry").Error("delete lock failed", zap.String("key", key), zap.Error(err))
+					continue
+				}
+				return
+			}
+		}()
+	}
+	return err
 }

@@ -3,6 +3,7 @@ module github.com/walleframe/svc_etcd
 go 1.18
 
 require (
+	github.com/google/uuid v1.5.0
 	github.com/json-iterator/go v1.1.12
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.8.4
