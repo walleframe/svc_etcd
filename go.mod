@@ -3,14 +3,14 @@ module github.com/walleframe/svc_etcd
 go 1.18
 
 require (
-	github.com/google/uuid v1.5.0
+	github.com/google/uuid v1.6.0
 	github.com/json-iterator/go v1.1.12
 	github.com/spf13/pflag v1.0.5
-	github.com/stretchr/testify v1.8.4
-	github.com/walleframe/walle v0.0.1
+	github.com/stretchr/testify v1.9.0
+	github.com/walleframe/walle v0.0.2
 	go.etcd.io/etcd/client/v3 v3.5.11
 	go.uber.org/multierr v1.10.0
-	go.uber.org/zap v1.26.0
+	go.uber.org/zap v1.27.0
 )
 
 require (
